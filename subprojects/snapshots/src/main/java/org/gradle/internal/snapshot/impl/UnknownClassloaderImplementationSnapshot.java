@@ -29,7 +29,7 @@ public class UnknownClassloaderImplementationSnapshot extends ImplementationSnap
 
     @Override
     public void appendToHasher(Hasher hasher) {
-        hasher.markAsInvalid(getUnknownReason());
+        throw new RuntimeException("Cannot hash unknown implementation");
     }
 
     @Override

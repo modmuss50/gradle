@@ -19,9 +19,9 @@ package org.gradle.internal.execution.caching.impl;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSortedMap;
 import com.google.common.collect.ImmutableSortedSet;
+import org.gradle.api.GradleException;
 import org.gradle.caching.BuildCacheKey;
 import org.gradle.internal.execution.caching.CachingDisabledReason;
-import org.gradle.internal.execution.caching.CachingDisabledReasonCategory;
 import org.gradle.internal.execution.caching.CachingInputs;
 import org.gradle.internal.execution.caching.CachingState;
 import org.gradle.internal.execution.caching.CachingStateBuilder;
@@ -37,15 +37,11 @@ import javax.annotation.OverridingMethodsMustInvokeSuper;
 import java.util.Map;
 import java.util.Optional;
 
-import static org.gradle.internal.execution.caching.CachingDisabledReasonCategory.NON_CACHEABLE_ADDITIONAL_IMPLEMENTATION;
-import static org.gradle.internal.execution.caching.CachingDisabledReasonCategory.NON_CACHEABLE_IMPLEMENTATION;
-
 public class DefaultCachingStateBuilder implements CachingStateBuilder {
     private ImplementationSnapshot implementation;
     private ImmutableList<ImplementationSnapshot> additionalImplementations = ImmutableList.of();
     private final ImmutableSortedMap.Builder<String, HashCode> inputValueFingerprintsBuilder = ImmutableSortedMap.naturalOrder();
     private ImmutableSortedMap<String, CurrentFileCollectionFingerprint> inputFileFingerprints = ImmutableSortedMap.of();
-    private final ImmutableSortedMap.Builder<String, String> nonCacheableInputPropertiesBuilder = ImmutableSortedMap.naturalOrder();
     private ImmutableSortedSet<String> outputProperties = ImmutableSortedSet.of();
     private final ImmutableList.Builder<CachingDisabledReason> noCachingReasonsBuilder = ImmutableList.builder();
 
@@ -58,10 +54,7 @@ public class DefaultCachingStateBuilder implements CachingStateBuilder {
     @OverridingMethodsMustInvokeSuper
     protected void processImplementation(ImplementationSnapshot implementation) {
         if (implementation.isUnknown()) {
-            noCachingReasonsBuilder.add(new CachingDisabledReason(
-                NON_CACHEABLE_IMPLEMENTATION,
-                "Implementation type " + implementation.getUnknownReason()
-            ));
+            throw new GradleException("Cannot calculate build cache key for work item with unknown implementation");
         }
     }
 
@@ -76,10 +69,7 @@ public class DefaultCachingStateBuilder implements CachingStateBuilder {
     @OverridingMethodsMustInvokeSuper
     protected void processAdditionalImplementation(ImplementationSnapshot additionalImplementation) {
         if (additionalImplementation.isUnknown()) {
-            noCachingReasonsBuilder.add(new CachingDisabledReason(
-                NON_CACHEABLE_ADDITIONAL_IMPLEMENTATION,
-                "Additional implementation type " + additionalImplementation.getUnknownReason()
-            ));
+            throw new GradleException("Cannot calculate build cache for additional action with unknown implementation");
         }
     }
 
@@ -88,23 +78,14 @@ public class DefaultCachingStateBuilder implements CachingStateBuilder {
         fingerprints.forEach((propertyName, fingerprint) -> {
             Hasher hasher = Hashing.newHasher();
             fingerprint.appendToHasher(hasher);
-            if (hasher.isValid()) {
-                HashCode hash = hasher.hash();
-                recordInputValueFingerprint(propertyName, hash);
-            } else {
-                markInputValuePropertyNotCacheable(propertyName, hasher.getInvalidReason());
-            }
+            HashCode hash = hasher.hash();
+            recordInputValueFingerprint(propertyName, hash);
         });
     }
 
     @OverridingMethodsMustInvokeSuper
     protected void recordInputValueFingerprint(String propertyName, HashCode fingerprint) {
         inputValueFingerprintsBuilder.put(propertyName, fingerprint);
-    }
-
-    @OverridingMethodsMustInvokeSuper
-    protected void markInputValuePropertyNotCacheable(String propertyName, String nonCacheableReason) {
-        nonCacheableInputPropertiesBuilder.put(propertyName, nonCacheableReason);
     }
 
     @Override
@@ -131,9 +112,7 @@ public class DefaultCachingStateBuilder implements CachingStateBuilder {
 
         Hasher hasher = Hashing.newHasher();
         implementation.appendToHasher(hasher);
-        additionalImplementations.forEach(additionalImplementation -> {
-            additionalImplementation.appendToHasher(hasher);
-        });
+        additionalImplementations.forEach(additionalImplementation -> additionalImplementation.appendToHasher(hasher));
 
         inputValueFingerprints.forEach((propertyName, fingerprint) -> {
             hasher.putString(propertyName);
@@ -145,31 +124,7 @@ public class DefaultCachingStateBuilder implements CachingStateBuilder {
             hasher.putHash(fingerprint.getHash());
         });
 
-        outputProperties.forEach(propertyName -> hasher.putString(propertyName));
-
-        ImmutableSortedMap<String, String> nonCacheableInputPropertiesMap = nonCacheableInputPropertiesBuilder.build();
-        if (!nonCacheableInputPropertiesMap.isEmpty()) {
-            StringBuilder builder = new StringBuilder("Non-cacheable inputs: ");
-            boolean first = true;
-            for (Map.Entry<String, String> entry : nonCacheableInputPropertiesMap.entrySet()) {
-                if (!first) {
-                    builder.append(", ");
-                }
-                first = false;
-                builder
-                    .append("property '")
-                    .append(entry.getKey())
-                    .append("' ")
-                    .append(entry.getValue());
-            }
-            String message = builder.toString();
-            noCachingReasonsBuilder.add(new CachingDisabledReason(
-                CachingDisabledReasonCategory.NON_CACHEABLE_INPUTS,
-                message
-            ));
-            hasher.markAsInvalid(message);
-        }
-        ImmutableSortedSet<String> nonCacheableInputProperties = nonCacheableInputPropertiesMap.keySet();
+        outputProperties.forEach(hasher::putString);
 
         CachingInputs inputs = new DefaultCachingInputs(
             implementation,
@@ -177,7 +132,7 @@ public class DefaultCachingStateBuilder implements CachingStateBuilder {
             inputValueFingerprints,
             inputFileFingerprints,
             outputProperties,
-            nonCacheableInputProperties
+            ImmutableSortedSet.of()
         );
 
         ImmutableList<CachingDisabledReason> cachingDisabledReasons = noCachingReasonsBuilder.build();
@@ -185,10 +140,7 @@ public class DefaultCachingStateBuilder implements CachingStateBuilder {
         if (cachingDisabledReasons.isEmpty()) {
             return new CachedState(hasher.hash(), inputs);
         } else {
-            HashCode key = hasher.isValid()
-                ? hasher.hash()
-                : null;
-            return new NonCachedState(key, cachingDisabledReasons, inputs);
+            return new NonCachedState(hasher.hash(), cachingDisabledReasons, inputs);
         }
     }
 
